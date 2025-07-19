@@ -3,7 +3,6 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-import argparse
 import gc
 import logging
 import sys
@@ -11,6 +10,8 @@ import time
 from typing import List, Optional
 
 from cuml.linear_model import LogisticRegression
+import hydra
+from omegaconf import DictConfig
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed
@@ -22,7 +23,6 @@ from dinov2.data import make_dataset
 from dinov2.data.transforms import make_classification_eval_transform
 from dinov2.distributed import get_global_rank, get_global_size
 from dinov2.eval.metrics import MetricType, build_metric
-from dinov2.eval.setup import get_args_parser as get_setup_args_parser
 from dinov2.eval.setup import setup_and_build_model
 from dinov2.eval.utils import evaluate, extract_features
 from dinov2.utils.dtype import as_torch_dtype
@@ -33,77 +33,6 @@ logger = logging.getLogger("dinov2")
 DEFAULT_MAX_ITER = 1_000
 C_POWER_RANGE = torch.linspace(-6, 5, 45)
 _CPU_DEVICE = torch.device("cpu")
-
-
-def get_args_parser(
-    description: Optional[str] = None,
-    parents: Optional[List[argparse.ArgumentParser]] = None,
-    add_help: bool = True,
-):
-    parents = parents or []
-    setup_args_parser = get_setup_args_parser(parents=parents, add_help=False)
-    parents = [setup_args_parser]
-    parser = argparse.ArgumentParser(
-        description=description,
-        parents=parents,
-        add_help=add_help,
-    )
-    parser.add_argument(
-        "--train-dataset",
-        dest="train_dataset_str",
-        type=str,
-        help="Training dataset",
-    )
-    parser.add_argument(
-        "--val-dataset",
-        dest="val_dataset_str",
-        type=str,
-        help="Validation dataset",
-    )
-    parser.add_argument(
-        "--finetune-dataset-str",
-        dest="finetune_dataset_str",
-        type=str,
-        help="Fine-tuning dataset",
-    )
-    parser.add_argument(
-        "--finetune-on-val",
-        action="store_true",
-        help="If there is no finetune dataset, whether to choose the "
-        "hyperparameters on the val set instead of 10%% of the train dataset",
-    )
-    parser.add_argument(
-        "--metric-type",
-        type=MetricType,
-        choices=list(MetricType),
-        help="Metric type",
-    )
-    parser.add_argument(
-        "--train-features-device",
-        type=str,
-        help="Device to gather train features (cpu, cuda, cuda:0, etc.), default: %(default)s",
-    )
-    parser.add_argument(
-        "--train-dtype",
-        type=str,
-        help="Data type to convert the train features to (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--max-train-iters",
-        type=int,
-        help="Maximum number of train iterations (default: %(default)s)",
-    )
-    parser.set_defaults(
-        train_dataset_str="ImageNet:split=TRAIN",
-        val_dataset_str="ImageNet:split=VAL",
-        finetune_dataset_str=None,
-        metric_type=MetricType.MEAN_ACCURACY,
-        train_features_device="cpu",
-        train_dtype="float64",
-        max_train_iters=DEFAULT_MAX_ITER,
-        finetune_on_val=False,
-    )
-    return parser
 
 
 class LogRegModule(nn.Module):
@@ -150,7 +79,15 @@ def evaluate_model(*, logreg_model, logreg_metric, test_data_loader, device):
     return evaluate(nn.Identity(), test_data_loader, postprocessors, metrics, device)
 
 
-def train_for_C(*, C, max_iter, train_features, train_labels, dtype=torch.float64, device=_CPU_DEVICE):
+def train_for_C(
+    *,
+    C,
+    max_iter,
+    train_features,
+    train_labels,
+    dtype=torch.float64,
+    device=_CPU_DEVICE,
+):
     logreg_model = LogRegModule(C, max_iter=max_iter, dtype=dtype, device=device)
     logreg_model.fit(train_features, train_labels)
     return logreg_model
@@ -275,10 +212,18 @@ def eval_log_regression(
     start = time.time()
 
     train_features, train_labels = extract_features(
-        model, train_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
+        model,
+        train_dataset,
+        batch_size,
+        num_workers,
+        gather_on_cpu=(train_features_device == _CPU_DEVICE),
     )
     val_features, val_labels = extract_features(
-        model, val_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
+        model,
+        val_dataset,
+        batch_size,
+        num_workers,
+        gather_on_cpu=(train_features_device == _CPU_DEVICE),
     )
     val_data_loader = torch.utils.data.DataLoader(
         TensorDataset(val_features, val_labels),
@@ -297,12 +242,22 @@ def eval_log_regression(
         indices = torch.randperm(len(train_features), device=train_features.device)
         finetune_index = indices[: len(train_features) // 10]
         train_index = indices[len(train_features) // 10 :]
-        finetune_features, finetune_labels = train_features[finetune_index], train_labels[finetune_index]
-        train_features, train_labels = train_features[train_index], train_labels[train_index]
+        finetune_features, finetune_labels = (
+            train_features[finetune_index],
+            train_labels[finetune_index],
+        )
+        train_features, train_labels = (
+            train_features[train_index],
+            train_labels[train_index],
+        )
     else:
         logger.info("Choosing hyperparameters on the finetune dataset")
         finetune_features, finetune_labels = extract_features(
-            model, finetune_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
+            model,
+            finetune_dataset,
+            batch_size,
+            num_workers,
+            gather_on_cpu=(train_features_device == _CPU_DEVICE),
         )
     # release the model - free GPU memory
     del model
@@ -376,11 +331,21 @@ def eval_log_regression_with_model(
     transform = make_classification_eval_transform(resize_size=224)
     target_transform = None
 
-    train_dataset = make_dataset(dataset_str=train_dataset_str, transform=transform, target_transform=target_transform)
-    val_dataset = make_dataset(dataset_str=val_dataset_str, transform=transform, target_transform=target_transform)
+    train_dataset = make_dataset(
+        dataset_str=train_dataset_str,
+        transform=transform,
+        target_transform=target_transform,
+    )
+    val_dataset = make_dataset(
+        dataset_str=val_dataset_str,
+        transform=transform,
+        target_transform=target_transform,
+    )
     if finetune_dataset_str is not None:
         finetune_dataset = make_dataset(
-            dataset_str=finetune_dataset_str, transform=transform, target_transform=target_transform
+            dataset_str=finetune_dataset_str,
+            transform=transform,
+            target_transform=target_transform,
         )
     else:
         finetune_dataset = None
@@ -402,7 +367,8 @@ def eval_log_regression_with_model(
 
     results_dict = {
         "top-1": results_dict_logreg["top-1"].cpu().numpy() * 100.0,
-        "top-5": results_dict_logreg.get("top-5", torch.tensor(0.0)).cpu().numpy() * 100.0,
+        "top-5": results_dict_logreg.get("top-5", torch.tensor(0.0)).cpu().numpy()
+        * 100.0,
         "best_C": results_dict_logreg["best_C"],
     }
     logger.info(
@@ -420,25 +386,23 @@ def eval_log_regression_with_model(
     return results_dict
 
 
-def main(args):
-    model, autocast_dtype = setup_and_build_model(args)
+@hydra.main(config_path="../configs", config_name="ssl_default_config")
+def main(cfg: DictConfig):
+    model, autocast_dtype = setup_and_build_model(cfg)
     eval_log_regression_with_model(
         model=model,
-        train_dataset_str=args.train_dataset_str,
-        val_dataset_str=args.val_dataset_str,
-        finetune_dataset_str=args.finetune_dataset_str,
+        train_dataset_str=cfg.train_dataset_str,
+        val_dataset_str=cfg.val_dataset_str,
+        finetune_dataset_str=cfg.finetune_dataset_str,
         autocast_dtype=autocast_dtype,
-        finetune_on_val=args.finetune_on_val,
-        metric_type=args.metric_type,
-        train_dtype=as_torch_dtype(args.train_dtype),
-        train_features_device=torch.device(args.train_features_device),
-        max_train_iters=args.max_train_iters,
+        finetune_on_val=cfg.finetune_on_val,
+        metric_type=cfg.metric_type,
+        train_dtype=as_torch_dtype(cfg.train_dtype),
+        train_features_device=torch.device(cfg.train_features_device),
+        max_train_iters=cfg.max_train_iters,
     )
     return 0
 
 
 if __name__ == "__main__":
-    description = "DINOv2 logistic regression evaluation"
-    args_parser = get_args_parser(description=description)
-    args = args_parser.parse_args()
-    sys.exit(main(args))
+    main()

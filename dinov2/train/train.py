@@ -3,16 +3,23 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-import argparse
+import hydra
+from omegaconf import DictConfig
+
 import logging
 import math
 import os
 from functools import partial
 
-from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+from fvcore.common.checkpoint import PeriodicCheckpointer
 
-from dinov2.data import SamplerType, make_data_loader, make_dataset
+from dinov2.data import (
+    SamplerType,
+    make_data_loader,
+    make_dataset,
+    SemiSupervisedWrapper,
+)
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
 from dinov2.fsdp import FSDPCheckpointer
@@ -23,43 +30,16 @@ from dinov2.utils.utils import CosineScheduler
 from dinov2.train.ssl_meta_arch import SSLMetaArch
 
 
-torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
+torch.backends.cuda.matmul.allow_tf32 = (
+    True  # PyTorch 1.12 sets this to False by default
+)
 logger = logging.getLogger("dinov2")
 
 
-def get_args_parser(add_help: bool = True):
-    parser = argparse.ArgumentParser("DINOv2 training", add_help=add_help)
-    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        help="Whether to not attempt to resume from the checkpoint directory. ",
-    )
-    parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
-    parser.add_argument("--eval", type=str, default="", help="Eval type to perform")
-    parser.add_argument(
-        "opts",
-        help="""
-Modify config options at the end of the command. For Yacs configs, use
-space-separated "PATH.KEY VALUE" pairs.
-For python-based LazyConfig, use "path.key=value".
-        """.strip(),
-        default=None,
-        nargs=argparse.REMAINDER,
-    )
-    parser.add_argument(
-        "--output-dir",
-        "--output_dir",
-        default="",
-        type=str,
-        help="Output directory to save logs and checkpoints",
-    )
-
-    return parser
-
-
 def build_optimizer(cfg, params_groups):
-    return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+    return torch.optim.AdamW(
+        params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2)
+    )
 
 
 def build_schedulers(cfg):
@@ -148,9 +128,16 @@ def do_train(cfg, model, resume=False):
     ) = build_schedulers(cfg)
 
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    checkpointer = FSDPCheckpointer(
+        model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True
+    )
 
-    start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+    start_iter = (
+        checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get(
+            "iteration", -1
+        )
+        + 1
+    )
 
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
@@ -191,20 +178,67 @@ def do_train(cfg, model, resume=False):
 
     # setup data loader
 
-    dataset = make_dataset(
-        dataset_str=cfg.train.dataset_path,
-        transform=data_transform,
-        target_transform=lambda _: (),
-    )
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.SHARDED_INFINITE
+    # Check if we're using the new config-based dataset loading or old string-based
+    if hasattr(cfg, "data") and hasattr(cfg.data, "dataset"):
+        # New config-based dataset loading
+        from dinov2.data.loaders import (
+            make_dataset_from_config,
+            make_semisupervised_dataset_from_config,
+        )
+
+        logger.info("Using config-based dataset loading")
+
+        # Check if semi-supervised training is enabled
+        if hasattr(cfg.train, "use_semisupervised") and cfg.train.use_semisupervised:
+            logger.info("Creating semi-supervised dataset")
+            dataset = make_semisupervised_dataset_from_config(
+                cfg.data,
+                split="train",
+                transform=data_transform,
+                target_transform=lambda _: (),
+            )
+        else:
+            logger.info("Creating standard dataset")
+            dataset = make_dataset_from_config(
+                cfg.data,
+                split="train",
+                transform=data_transform,
+                target_transform=lambda _: (),
+            )
+
+        # Use num_workers from data config
+        num_workers = cfg.data.num_workers
+    else:
+        # Original string-based dataset loading
+        logger.info("Using string-based dataset loading")
+        dataset = make_dataset(
+            dataset_str=cfg.train.dataset_path,
+            transform=data_transform,
+            target_transform=lambda _: (),
+        )
+
+        # Use num_workers from train config
+        num_workers = cfg.train.num_workers
+
+    # Determine sampler type and parameters
+    if hasattr(cfg.train, "use_semisupervised") and cfg.train.use_semisupervised:
+        sampler_type = SamplerType.SEMI_SUPERVISED
+        supervised_per_batch = cfg.train.get("supervised_per_batch", 0)
+        logger.info(
+            f"Using semi-supervised sampler with {supervised_per_batch} supervised samples per batch"
+        )
+    else:
+        sampler_type = SamplerType.SHARDED_INFINITE
+        supervised_per_batch = 0
+
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=cfg.train.batch_size_per_gpu,
-        num_workers=cfg.train.num_workers,
+        num_workers=num_workers,
         shuffle=True,
         seed=start_iter,  # TODO: Fix this -- cfg.train.seed
         sampler_type=sampler_type,
+        supervised_per_batch=supervised_per_batch,
         sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
         drop_last=True,
         collate_fn=collate_fn,
@@ -268,7 +302,9 @@ def do_train(cfg, model, resume=False):
         if distributed.get_global_size() > 1:
             for v in loss_dict.values():
                 torch.distributed.all_reduce(v)
-        loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
+        loss_dict_reduced = {
+            k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()
+        }
 
         if math.isnan(sum(loss_dict_reduced.values())):
             logger.info("NaN detected")
@@ -284,7 +320,10 @@ def do_train(cfg, model, resume=False):
 
         # checkpointing and testing
 
-        if cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0:
+        if (
+            cfg.evaluation.eval_period_iterations > 0
+            and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
+        ):
             do_test(cfg, model, f"training_{iteration}")
             torch.cuda.synchronize()
         periodic_checkpointer.step(iteration)
@@ -294,25 +333,26 @@ def do_train(cfg, model, resume=False):
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-def main(args):
-    cfg = setup(args)
-
+@hydra.main(config_path="../configs", config_name="ssl_default_config")
+def main(cfg: DictConfig):
+    cfg = setup(cfg)
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
     model.prepare_for_distributed_training()
 
     logger.info("Model:\n{}".format(model))
-    if args.eval_only:
+    if getattr(cfg, "eval_only", False):
         iteration = (
             FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
-            .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
+            .resume_or_load(
+                cfg.MODEL.WEIGHTS, resume=not getattr(cfg, "no_resume", False)
+            )
             .get("iteration", -1)
             + 1
         )
         return do_test(cfg, model, f"manual_{iteration}")
 
-    do_train(cfg, model, resume=not args.no_resume)
+    do_train(cfg, model, resume=not getattr(cfg, "no_resume", False))
 
 
 if __name__ == "__main__":
-    args = get_args_parser(add_help=True).parse_args()
-    main(args)
+    main()
