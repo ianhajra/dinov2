@@ -19,6 +19,7 @@ from dinov2.data import (
     make_data_loader,
     make_dataset,
     SemiSupervisedWrapper,
+    DataLoaderResetWrapper
 )
 from dinov2.data import (
     collate_data_and_cast,
@@ -265,6 +266,9 @@ def do_train(cfg, model, resume=False):
         collate_fn=collate_fn,
     )
 
+    if is_semisup:
+        #As DINOV2 uses SHARDED_INFINITE sampler, we need to wrap the data loader 
+        data_loader = DataLoaderResetWrapper(data_loader)
     # training loop
 
     iteration = start_iter
