@@ -5,8 +5,8 @@ def label_graph(gathered_targets, n_global_crops, n_local_crops, device=None):
     """
     Returns: [N_local * bs, N_global * bs] bool matrix
     """
-    local_labels  = gathered_targets.repeat_interleave(n_local_crops).unsqueeze(1)   # [N_local, 1]
-    global_labels = gathered_targets.repeat_interleave(n_global_crops).unsqueeze(0)  # [1, N_global]
+    local_labels  = gathered_targets.repeat(n_local_crops).unsqueeze(1)   # [N_local, 1]
+    global_labels = gathered_targets.repeat(n_global_crops).unsqueeze(0)  # [1, N_global]
     G = (local_labels == global_labels).bool()  # [N_local * bs, N_global * bs]
 
     if device is not None:
@@ -25,8 +25,8 @@ def semisup_graph(
     
     batch_size = gathered_is_supervised.shape[0]
 
-    local_mask  = gathered_is_supervised.repeat_interleave(n_local_crops).unsqueeze(1).bool()
-    global_mask = gathered_is_supervised.repeat_interleave(n_global_crops).unsqueeze(0).bool()
+    local_mask  = gathered_is_supervised.repeat(n_local_crops).unsqueeze(1).bool()
+    global_mask = gathered_is_supervised.repeat(n_global_crops).unsqueeze(0).bool()
     mask = local_mask & global_mask  # [N_local * bs, N_global * bs]
 
     G = labels_graph.bool() & mask
@@ -41,17 +41,18 @@ def nview_graph(batch_size, n_global_crops, n_local_crops, device=None):
     """
     Returns: [N_local * bs, N_global * bs] bool matrix
     """
-    num_global = batch_size * n_global_crops
-    num_local = batch_size * n_local_crops
-    G = torch.zeros((num_local, num_global), dtype=torch.bool)
+    n_rows = n_local_crops * batch_size
+    n_cols = n_global_crops * batch_size
 
-    for i in range(batch_size):
-        global_indices = torch.arange(i * n_global_crops, (i + 1) * n_global_crops)
-        local_indices  = torch.arange(i * n_local_crops, (i + 1) * n_local_crops)
-        G[local_indices.unsqueeze(1), global_indices] = True
+
+    local_base_indices = torch.arange(n_rows).remainder(batch_size)
+    global_base_indices = torch.arange(n_cols).remainder(batch_size)
+
+    G = (local_base_indices.view(-1, 1) == global_base_indices.view(1, -1))
 
     if device is not None:
         G = G.to(device)
+        
     return G
 
 
