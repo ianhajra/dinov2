@@ -64,40 +64,55 @@ class DINOLoss(nn.Module):
 
     def forward(
         self, student_output_list, teacher_out_softmaxed_centered_list, graph=None
-    ):
+    ):  
         BS = len(student_output_list[0])
         is_global = len(student_output_list) == len(teacher_out_softmaxed_centered_list)
 
         if graph is not None:
-            student_cls_tokens = torch.cat(
-                student_output_list, dim=0
-            )  # shape: (N_CROPS * BS, D)
-            teacher_softmaxed_cls = torch.cat(
-                list(teacher_out_softmaxed_centered_list), dim=0
-            )  # shape: (N_CROPS * BS, D)
+            if is_global:
+                total_loss = 0
+                N = len(student_output_list)
+                
+                lsm_student = torch.stack([F.log_softmax(s / self.student_temp, dim=-1) for s in student_output_list])
+                t_teacher = torch.stack(teacher_out_softmaxed_centered_list)
+                    
+                for i in range(N):
+                    for j in range(N):
+                        loss = torch.sum(t_teacher[i] * lsm_student[j], dim=-1)
+                        total_loss -= graph[i, j] * loss.mean()
+                    
+                return total_loss
+            
+            else:
+                student_cls_tokens = torch.cat(
+                    student_output_list, dim=0
+                )  # shape: (N_CROPS * BS, D)
+                teacher_softmaxed_cls = torch.cat(
+                    list(teacher_out_softmaxed_centered_list), dim=0
+                )  # shape: (N_CROPS * BS, D)
 
-            log_p_s = F.log_softmax(student_cls_tokens / self.student_temp, dim=-1)
-            teacher_softmaxed_cls = teacher_softmaxed_cls.to(log_p_s.dtype)
+                log_p_s = F.log_softmax(student_cls_tokens / self.student_temp, dim=-1)
+                teacher_softmaxed_cls = teacher_softmaxed_cls.to(log_p_s.dtype)
 
-            # shape: (S_CROPS * BS, T_CROPS * BS)
-            H = -(log_p_s @ teacher_softmaxed_cls.t())
+                # shape: (S_CROPS * BS, T_CROPS * BS)
+                H = -(log_p_s @ teacher_softmaxed_cls.t())
 
-            assert graph.shape == H.shape, (
-                f"Graph shape {graph.shape} must match entropy matrix {H.shape}"
-            )
+                assert graph.shape == H.shape, (
+                    f"Graph shape {graph.shape} must match entropy matrix {H.shape}"
+                )
 
-            # Rem: Should remove the main diag of G?
-            # TODO eq (3) of https://arxiv.org/pdf/2104.14294
+                # Rem: Should remove the main diag of G?
+                # TODO eq (3) of https://arxiv.org/pdf/2104.14294
 
-            G = graph.to(H.device)
-            # G.view(-1)[:: (G.shape[0] + 1)].fill_(0)  # Trick to fill diagonal with 0
-            total_loss = (G * H).sum() / BS
+                G = graph.to(H.device)
+                # G.view(-1)[:: (G.shape[0] + 1)].fill_(0)  # Trick to fill diagonal with 0
+                total_loss = (G * H).sum() / BS
 
-            # devide by 2 as global flattened crops are counted twice
-            total_loss = total_loss / 2 if is_global else total_loss
+                # devide by 2 as global flattened crops are counted twice
+                total_loss = total_loss / 2 if is_global else total_loss
 
-            return total_loss
-
+                return total_loss
+            
         else:
             total_loss = 0
             for s in student_output_list:
