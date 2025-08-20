@@ -450,7 +450,7 @@ def do_train(cfg, model, resume=False):
                 "batch_size": current_batch_size,
             }
             log_payload.update(loss_dict_reduced) # Add individual losses
-            wandb.log(log_payload, step=iteration)
+            # wandb.log(log_payload, step=iteration)
 
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
@@ -480,11 +480,11 @@ def main(cfg: DictConfig):
     if distributed.is_main_process():
         config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         run_name = os.path.basename(cfg.train.output_dir) if cfg.train.output_dir else None
-        wandb.init(
-            project="dinov2", 
-            config=config_dict,
-            name=run_name,
-        )
+        # wandb.init(
+        #     project="dinov2", 
+        #     config=config_dict,
+        #     name=run_name,
+        # )
 
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
     model.prepare_for_distributed_training()
