@@ -17,8 +17,10 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 from fvcore.common.checkpoint import Checkpointer, PeriodicCheckpointer
+from torchvision import transforms
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
+from dinov2.data.loaders import make_dataset_from_config
 from dinov2.data.transforms import (
     make_classification_eval_transform,
     make_classification_train_transform,
@@ -31,8 +33,9 @@ from dinov2.eval.metrics import (
     build_topk_accuracy_metric,
 )
 from dinov2.eval.setup import setup_and_build_model
-from dinov2.eval.utils import ModelWithIntermediateLayers, ModelWithNormalize, evaluate
+from dinov2.eval.utils import evaluate, ModelWithIntermediateLayers
 from dinov2.logging import MetricLogger
+from dinov2.utils.config import setup
 
 
 logger = logging.getLogger("dinov2")
@@ -127,12 +130,12 @@ def scale_lr(learning_rates, batch_size):
 
 
 def setup_linear_classifiers(
-    sample_output, n_last_blocks_list, learning_rates, batch_size, num_classes=1000
+    sample_output, n_last_blocks_list, avgpool_patchtokens, learning_rates, batch_size, num_classes=1000
 ):
     linear_classifiers_dict = nn.ModuleDict()
     optim_param_groups = []
     for n in n_last_blocks_list:
-        for avgpool in [False, True]:
+        for avgpool in avgpool_patchtokens:
             for _lr in learning_rates:
                 lr = scale_lr(_lr, batch_size)
                 out_dim = create_linear_input(
@@ -234,8 +237,8 @@ def eval_linear(
     scheduler,
     output_dir,
     max_iter,
-    checkpoint_period,  # In number of iter, creates a new file every period
-    running_checkpoint_period,  # Period to update main checkpoint file
+    checkpoint_period,
+    running_checkpoint_period,
     eval_period,
     metric_type,
     training_num_classes,
@@ -279,20 +282,16 @@ def eval_linear(
         }
         loss = sum(losses.values())
 
-        # compute the gradients
         optimizer.zero_grad()
         loss.backward()
 
-        # step
         optimizer.step()
         scheduler.step()
 
-        # log
         if iteration % 10 == 0:
             torch.cuda.synchronize()
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-            print("lr", optimizer.param_groups[0]["lr"])
 
         if iteration - start_iter > 5:
             if iteration % running_checkpoint_period == 0:
@@ -338,32 +337,11 @@ def eval_linear(
     return val_results_dict, feature_model, linear_classifiers, iteration
 
 
-def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type):
-    test_dataset = make_dataset(
-        dataset_str=test_dataset_str,
-        transform=make_classification_eval_transform(),
-    )
-    test_data_loader = make_data_loader(
-        dataset=test_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        sampler_type=SamplerType.DISTRIBUTED,
-        drop_last=False,
-        shuffle=False,
-        persistent_workers=False,
-        collate_fn=(
-            _pad_and_collate
-            if metric_type == MetricType.IMAGENET_REAL_ACCURACY
-            else None
-        ),
-    )
-    return test_data_loader
-
-
 def test_on_datasets(
     feature_model,
     linear_classifiers,
-    test_dataset_strs,
+    cfg,
+    test_splits_or_strs,
     batch_size,
     num_workers,
     test_metric_types,
@@ -375,13 +353,31 @@ def test_on_datasets(
     test_class_mappings=[None],
 ):
     results_dict = {}
-    for test_dataset_str, class_mapping, metric_type in zip(
-        test_dataset_strs, test_class_mappings, test_metric_types
+    has_new_data_config = hasattr(cfg, "data") and hasattr(cfg.data, "dataset")
+    eval_transform = make_classification_eval_transform()
+    eval_transform.transforms.insert(0, transforms.Lambda(lambda x: x.convert("RGB")))
+
+    for split_or_str, class_mapping, metric_type in zip(
+        test_splits_or_strs, test_class_mappings, test_metric_types
     ):
-        logger.info(f"Testing on {test_dataset_str}")
-        test_data_loader = make_eval_data_loader(
-            test_dataset_str, batch_size, num_workers, metric_type
+        logger.info(f"Testing on {split_or_str}")
+
+        if has_new_data_config:
+            test_dataset = make_dataset_from_config(cfg.data, split=split_or_str, transform=eval_transform)
+        else:
+            test_dataset = make_dataset(dataset_str=split_or_str, transform=eval_transform)
+
+        test_data_loader = make_data_loader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler_type=SamplerType.DISTRIBUTED,
+            drop_last=False,
+            shuffle=False,
+            persistent_workers=False,
+            collate_fn=(_pad_and_collate if metric_type == MetricType.IMAGENET_REAL_ACCURACY else None),
         )
+
         dataset_results_dict = evaluate_linear_classifiers(
             feature_model,
             remove_ddp_wrapper(linear_classifiers),
@@ -394,7 +390,7 @@ def test_on_datasets(
             class_mapping=class_mapping,
             best_classifier_on_val=best_classifier_on_val,
         )
-        results_dict[f"{test_dataset_str}_accuracy"] = (
+        results_dict[f"{split_or_str}_accuracy"] = (
             100.0 * dataset_results_dict["best_classifier"]["accuracy"]
         )
     return results_dict
@@ -402,9 +398,8 @@ def test_on_datasets(
 
 def run_eval_linear(
     model,
+    cfg,
     output_dir,
-    train_dataset_str,
-    val_dataset_str,
     batch_size,
     epochs,
     epoch_length,
@@ -413,18 +408,27 @@ def run_eval_linear(
     eval_period_iterations,
     learning_rates,
     autocast_dtype,
-    test_dataset_strs=None,
+    n_last_blocks_list: List[int],
+    avgpool_patchtokens: List[bool],
     resume=True,
     classifier_fpath=None,
     val_class_mapping_fpath=None,
     test_class_mapping_fpaths=[None],
     val_metric_type=MetricType.MEAN_ACCURACY,
     test_metric_types=None,
+    train_dataset_str: Optional[str] = None,
+    val_dataset_str: Optional[str] = None,
+    test_dataset_strs=None,
 ):
     seed = 0
+    has_new_data_config = hasattr(cfg, "data") and hasattr(cfg.data, "dataset")
 
     if test_dataset_strs is None:
-        test_dataset_strs = [val_dataset_str]
+        if has_new_data_config:
+            test_dataset_strs = [cfg.data.val_split]
+        else:
+            test_dataset_strs = [val_dataset_str]
+
     if test_metric_types is None:
         test_metric_types = [val_metric_type] * len(test_dataset_strs)
     else:
@@ -432,17 +436,30 @@ def run_eval_linear(
     assert len(test_dataset_strs) == len(test_class_mapping_fpaths)
 
     train_transform = make_classification_train_transform()
-    train_dataset = make_dataset(
-        dataset_str=train_dataset_str,
-        transform=train_transform,
-    )
-    training_num_classes = len(
-        torch.unique(torch.Tensor(train_dataset.get_targets().astype(int)))
-    )
-    sampler_type = SamplerType.SHARDED_INFINITE
-    # sampler_type = SamplerType.INFINITE
+    train_transform.transforms.insert(0, transforms.Lambda(lambda x: x.convert("RGB")))
+    eval_transform = make_classification_eval_transform()
+    eval_transform.transforms.insert(0, transforms.Lambda(lambda x: x.convert("RGB")))
 
-    n_last_blocks_list = [1, 4]
+    if has_new_data_config:
+        logger.info("Using config-based dataset loading for linear eval")
+        train_dataset = make_dataset_from_config(cfg.data, split=cfg.data.train_split, transform=train_transform)
+        val_dataset = make_dataset_from_config(cfg.data, split=cfg.data.val_split, transform=eval_transform)
+    else:
+        logger.info("Using string-based dataset loading for linear eval")
+        train_dataset = make_dataset(dataset_str=train_dataset_str, transform=train_transform)
+        val_dataset = make_dataset(dataset_str=val_dataset_str, transform=eval_transform)
+
+    # Get the name of the primary label column from the dataset instance
+    label_col_name = train_dataset.label_col_names[0]
+    # Access the underlying HF dataset's column directly to get all targets
+    all_targets = train_dataset.dataset[label_col_name]
+    # Now, calculate the number of classes as before
+    training_num_classes = len(
+        torch.unique(torch.Tensor(all_targets).to(torch.int))
+    )
+
+    sampler_type = SamplerType.SHARDED_INFINITE
+
     n_last_blocks = max(n_last_blocks_list)
     autocast_ctx = partial(torch.cuda.amp.autocast, enabled=True, dtype=autocast_dtype)
     feature_model = ModelWithIntermediateLayers(model, n_last_blocks, autocast_ctx)
@@ -451,6 +468,7 @@ def run_eval_linear(
     linear_classifiers, optim_param_groups = setup_linear_classifiers(
         sample_output,
         n_last_blocks_list,
+        avgpool_patchtokens,
         learning_rates,
         batch_size,
         training_num_classes,
@@ -458,18 +476,10 @@ def run_eval_linear(
 
     optimizer = torch.optim.SGD(optim_param_groups, momentum=0.9, weight_decay=0)
     max_iter = epochs * epoch_length
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, max_iter, eta_min=0
-    )
-    checkpointer = Checkpointer(
-        linear_classifiers, output_dir, optimizer=optimizer, scheduler=scheduler
-    )
-    start_iter = (
-        checkpointer.resume_or_load(classifier_fpath or "", resume=resume).get(
-            "iteration", -1
-        )
-        + 1
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iter, eta_min=0)
+    checkpointer = Checkpointer(linear_classifiers, output_dir, optimizer=optimizer, scheduler=scheduler)
+    start_iter = (checkpointer.resume_or_load(classifier_fpath or "", resume=resume).get("iteration", -1) + 1)
+
     train_data_loader = make_data_loader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -481,8 +491,16 @@ def run_eval_linear(
         drop_last=True,
         persistent_workers=True,
     )
-    val_data_loader = make_eval_data_loader(
-        val_dataset_str, batch_size, num_workers, val_metric_type
+
+    val_data_loader = make_data_loader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sampler_type=SamplerType.DISTRIBUTED,
+        drop_last=False,
+        shuffle=False,
+        persistent_workers=False,
+        collate_fn=(_pad_and_collate if val_metric_type == MetricType.IMAGENET_REAL_ACCURACY else None),
     )
 
     checkpoint_period = save_checkpoint_frequency * epoch_length
@@ -523,10 +541,13 @@ def run_eval_linear(
         classifier_fpath=classifier_fpath,
     )
     results_dict = {}
-    if len(test_dataset_strs) > 1 or test_dataset_strs[0] != val_dataset_str:
+
+    current_val_str = cfg.data.val_split if has_new_data_config else val_dataset_str
+    if len(test_dataset_strs) > 1 or test_dataset_strs[0] != current_val_str:
         results_dict = test_on_datasets(
             feature_model,
             linear_classifiers,
+            cfg,
             test_dataset_strs,
             batch_size,
             0,  # num_workers,
@@ -539,7 +560,7 @@ def run_eval_linear(
             test_class_mappings=test_class_mappings,
         )
     results_dict["best_classifier"] = val_results_dict["best_classifier"]["name"]
-    results_dict[f"{val_dataset_str}_accuracy"] = (
+    results_dict[f"{current_val_str}_accuracy"] = (
         100.0 * val_results_dict["best_classifier"]["accuracy"]
     )
     logger.info("Test Results Dict " + str(results_dict))
@@ -549,28 +570,60 @@ def run_eval_linear(
 
 @hydra.main(config_path="../configs", config_name="ssl_default_config")
 def main(cfg: DictConfig):
+    setup(cfg)
     model, autocast_dtype = setup_and_build_model(cfg)
-    run_eval_linear(
-        model=model,
-        output_dir=cfg.train.output_dir,
-        train_dataset_str=cfg.train_dataset_str,
-        val_dataset_str=cfg.val_dataset_str,
-        test_dataset_strs=cfg.test_dataset_strs,
-        batch_size=cfg.batch_size,
-        epochs=cfg.epochs,
-        epoch_length=cfg.epoch_length,
-        num_workers=cfg.num_workers,
-        save_checkpoint_frequency=cfg.save_checkpoint_frequency,
-        eval_period_iterations=cfg.eval_period_iterations,
-        learning_rates=cfg.learning_rates,
-        autocast_dtype=autocast_dtype,
-        resume=not cfg.no_resume,
-        classifier_fpath=cfg.classifier_fpath,
-        val_metric_type=cfg.val_metric_type,
-        test_metric_types=cfg.test_metric_types,
-        val_class_mapping_fpath=cfg.val_class_mapping_fpath,
-        test_class_mapping_fpaths=cfg.test_class_mapping_fpaths,
-    )
+
+    if hasattr(cfg, "evaluation") and hasattr(cfg.evaluation, "linear"):
+        logger.info("Running linear evaluation with new config.")
+        lincfg = cfg.evaluation.linear
+        run_eval_linear(
+            model=model,
+            cfg=cfg,
+            output_dir=cfg.train.output_dir,
+            batch_size=lincfg.batch_size,
+            epochs=lincfg.epochs,
+            epoch_length=lincfg.get("epoch_length", cfg.train.OFFICIAL_EPOCH_LENGTH),
+            num_workers=cfg.data.num_workers,
+            save_checkpoint_frequency=lincfg.save_checkpoint_frequency,
+            eval_period_iterations=cfg.evaluation.eval_period_iterations,
+            learning_rates=lincfg.learning_rates,
+            autocast_dtype=autocast_dtype,
+            n_last_blocks_list=lincfg.n_last_blocks,
+            avgpool_patchtokens=lincfg.avgpool_patchtokens,
+            resume=not lincfg.get("no_resume", False),
+            classifier_fpath=lincfg.get("classifier_fpath"),
+            val_metric_type=lincfg.get("val_metric_type", MetricType.MEAN_ACCURACY),
+            test_metric_types=lincfg.get("test_metric_types"),
+            val_class_mapping_fpath=lincfg.get("val_class_mapping_fpath"),
+            test_class_mapping_fpaths=lincfg.get("test_class_mapping_fpaths", [None]),
+            test_dataset_strs=lincfg.get("test_splits"),
+        )
+    else:
+        logger.info("Running linear evaluation with old config.")
+        run_eval_linear(
+            model=model,
+            cfg=cfg,
+            output_dir=cfg.train.output_dir,
+            train_dataset_str=cfg.train_dataset_str,
+            val_dataset_str=cfg.val_dataset_str,
+            test_dataset_strs=cfg.test_dataset_strs,
+            batch_size=cfg.batch_size,
+            epochs=cfg.epochs,
+            epoch_length=cfg.epoch_length,
+            num_workers=cfg.num_workers,
+            save_checkpoint_frequency=cfg.save_checkpoint_frequency,
+            eval_period_iterations=cfg.eval_period_iterations,
+            learning_rates=cfg.learning_rates,
+            autocast_dtype=autocast_dtype,
+            n_last_blocks_list=[1, 4], # Hardcoded for backward compatibility
+            avgpool_patchtokens=[False, True], # Hardcoded for backward compatibility
+            resume=not cfg.no_resume,
+            classifier_fpath=cfg.classifier_fpath,
+            val_metric_type=cfg.val_metric_type,
+            test_metric_types=cfg.test_metric_types,
+            val_class_mapping_fpath=cfg.val_class_mapping_fpath,
+            test_class_mapping_fpaths=cfg.test_class_mapping_fpaths,
+        )
     return 0
 
 
