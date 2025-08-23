@@ -291,21 +291,21 @@ def do_train(cfg, model, resume=False):
             )
 
             graph_batch_size = (
-                data["collated_global_crops"].shape[0] * distributed.get_global_size()
+                  cfg.train.batch_size_per_gpu   * distributed.get_global_size()
             )
 
             if distributed.get_global_size() > 1:
-                #     data = distributed.all_gather_dict(data)
-                targets = distributed.all_gather_dict(targets)
-                is_sup = distributed.all_gather_dict(is_sup)
+                if targets.device != "cuda":
+                    targets = distributed.all_gather(targets.cuda(non_blocking=True))
+                    is_sup = distributed.all_gather(is_sup.cuda(non_blocking=True))
 
-            device = data["collated_global_crops"].device
+            device = targets.device
 
             view_graph = nview_graph(
-                batch_size=graph_batch_size // 2,
+                batch_size=graph_batch_size,
                 n_global_crops=2,
                 n_local_crops=cfg.crops.local_crops_number,
-                device=targets,
+                device=device,
             )
             labels_graph = label_graph(
                 gathered_targets=targets,
@@ -323,18 +323,16 @@ def do_train(cfg, model, resume=False):
             )
 
             view_graph_global = nview_graph(
-                batch_size=graph_batch_size // 2,
+                batch_size=graph_batch_size,
                 n_global_crops=2,
                 n_local_crops=2,
-                device=device,
-            )
+            ).cuda(non_blocking=True)
 
             labels_graph_global = label_graph(
                 gathered_targets=targets,
                 n_global_crops=2,
                 n_local_crops=2,
-                device=device,
-            )
+            ).cuda(non_blocking=True)
 
             semisup_graph_global_ = semisup_graph(
                 labels_graph=labels_graph_global,
@@ -342,10 +340,7 @@ def do_train(cfg, model, resume=False):
                 gathered_is_supervised=is_sup,
                 n_global_crops=2,
                 n_local_crops=2,
-                device=device,
-            )
-
-            print("using sem sup graph with ")
+            ).cuda(non_blocking=True)
 
             graph = {
                 "semisup_graph": semisup_graph_,
@@ -356,19 +351,20 @@ def do_train(cfg, model, resume=False):
             data = data_
             graph = None
 
+
         graph_batch_size = (
-            data["collated_global_crops"].shape[0] * distributed.get_global_size()
+                cfg.train.batch_size_per_gpu   * distributed.get_global_size()
         )
 
         if cfg.data.semisupervised.get("view_graph", False) == True:
             view_graph_global = nview_graph(
-                batch_size=graph_batch_size // 2,
+                batch_size=graph_batch_size,
                 n_global_crops=2,
                 n_local_crops=2,
             ).cuda(non_blocking=True)
 
             view_graph = nview_graph(
-                batch_size=graph_batch_size // 2,
+                batch_size=graph_batch_size,
                 n_global_crops=2,
                 n_local_crops=cfg.crops.local_crops_number,
             ).cuda(non_blocking=True)
@@ -378,7 +374,7 @@ def do_train(cfg, model, resume=False):
                 "semisup_graph_global": view_graph_global,
             }
 
-        current_batch_size = graph_batch_size / 2
+        current_batch_size = graph_batch_size
         if iteration > max_iter:
             return
 

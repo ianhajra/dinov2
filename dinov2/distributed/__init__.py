@@ -316,8 +316,15 @@ class GatherLayer(torch.autograd.Function):
 def all_gather(X, dim=0):
     """Gathers tensors from all processes, supporting backward propagation."""
 
+    if X.device.type != "cuda":
+        return X
+
+    if X.is_sparse:
+        X = X.to_dense()
+    X = X.contiguous()
+
     if torch.distributed.is_initialized():
-        return torch.cat(GatherLayer.apply(X.contiguous()), dim=dim)
+        return torch.cat(GatherLayer.apply(X), dim=dim)
 
     return X
 

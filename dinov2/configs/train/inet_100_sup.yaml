@@ -11,13 +11,16 @@ hydra:
   mode: MULTIRUN
   launcher:
     max_num_timeout: 999
-    gpus_per_node: 8
+    gpus_per_node: 2
     tasks_per_node: ${hydra.launcher.gpus_per_node}
-    cpus_per_task: 10
-    mem_gb: 60
-    timeout_min: 120
-    partition: scavenge,learnfair,dev
+    cpus_per_task: 6
+    mem_gb: 32
+    timeout_min: 1200
     signal_delay_s: 120
+    partition: long
+    additional_parameters:
+      output: logs/%x_%j.out       # e.g. logs/<jobname>_<jobid>.out
+      error:  logs/%x_%j.err       # separate error stream
   job:
     chdir: true
   run:
@@ -75,7 +78,7 @@ data:
   val_split: "validation"
   config_name: null
   num_classes: 100
-  num_workers: 10
+  num_workers: 6
   seed: 983245
   # Optional additional parameters
   trust_remote_code: true
@@ -125,7 +128,7 @@ optim:
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 train:
-  batch_size_per_gpu: 32
+  batch_size_per_gpu: 128
   output_dir: "./outputs_inet100_sup"
   saveckp_freq: 100
   seed: 0
