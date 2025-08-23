@@ -299,7 +299,7 @@ def do_train(cfg, model, resume=False):
                 targets = distributed.all_gather_dict(targets)
                 is_sup = distributed.all_gather_dict(is_sup)
 
-            device = next(iter(targets.values())).device
+            device = data["collated_global_crops"].device
 
             view_graph = nview_graph(
                 batch_size=graph_batch_size // 2,
@@ -450,7 +450,7 @@ def do_train(cfg, model, resume=False):
                 "batch_size": current_batch_size,
             }
             log_payload.update(loss_dict_reduced) # Add individual losses
-            # wandb.log(log_payload, step=iteration)
+            wandb.log(log_payload, step=iteration)
 
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
@@ -480,11 +480,26 @@ def main(cfg: DictConfig):
     if distributed.is_main_process():
         config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         run_name = os.path.basename(cfg.train.output_dir) if cfg.train.output_dir else None
-        # wandb.init(
-        #     project="dinov2", 
-        #     config=config_dict,
-        #     name=run_name,
-        # )
+        run_id_file = os.path.join(cfg.train.output_dir, "wandb_run_id.txt")
+        run_id = None
+        should_resume_run = not getattr(cfg, "no_resume", False)
+
+        if should_resume_run and os.path.exists(run_id_file):
+            with open(run_id_file, "r") as f:
+                run_id = f.read().strip()
+            logger.info(f"Resuming W&B run with ID: {run_id}")
+        wandb.init(
+            project="dinov2",
+            config=config_dict,
+            name=run_name,
+            id=run_id,  
+            resume="allow", 
+        )
+        if run_id is None:
+            logger.info(f"New W&B run started with ID: {wandb.run.id}")
+            os.makedirs(cfg.train.output_dir, exist_ok=True)
+            with open(run_id_file, "w") as f:
+                f.write(wandb.run.id)
 
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
     model.prepare_for_distributed_training()
