@@ -2,22 +2,37 @@
 # This shows how to use the new configuration-based dataset loading system
 
 # Hydra configuration
+# defaults:
+#   - _self_
+#   - override hydra/launcher: submitit_slurm
+
+# hydra:
+#   output_subdir: null
+#   mode: MULTIRUN
+#   launcher:
+#     max_num_timeout: 999
+#     gpus_per_node: 2
+#     tasks_per_node: ${hydra.launcher.gpus_per_node}
+#     cpus_per_task: 6
+#     mem_gb: 32
+#     timeout_min: 1200
+#     signal_delay_s: 120
+#     partition: long
+#     additional_parameters:
+#       output: logs/%x_%j.out       # e.g. logs/<jobname>_<jobid>.out
+#       error:  logs/%x_%j.err       # separate error stream
+#   job:
+#     chdir: true
+#   run:
+#     dir: .
+
 defaults:
   - _self_
-  - override hydra/launcher: submitit_slurm
+  - hydra/launcher: submitit_local # Change to submitit_slurm for SLURM clusters
 
+# disable hydra outputs
 hydra:
   output_subdir: null
-  mode: MULTIRUN
-  launcher:
-    max_num_timeout: 999
-    gpus_per_node: 2
-    tasks_per_node: ${hydra.launcher.gpus_per_node}
-    cpus_per_task: 6
-    mem_gb: 32
-    timeout_min: 1200
-    signal_delay_s: 120
-    partition: long
   job:
     chdir: true
   run:
@@ -124,12 +139,12 @@ optim:
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 train:
-  batch_size_per_gpu: 128
+  batch_size_per_gpu: 64
   output_dir: "./outputs_inet100_ssl"
   saveckp_freq: 100
   seed: 0
   # num_workers is now taken from data.num_workers
-  OFFICIAL_EPOCH_LENGTH: 494 # IN-100 126689 // 256 = 494
+  OFFICIAL_EPOCH_LENGTH: 1979 #1250 for in-1k? 
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
 
@@ -178,3 +193,4 @@ evaluation:
     epochs: 100
     batch_size: 256
     save_checkpoint_frequency: 1
+pretrained_weights: "outputs_inet100_ssl/eval/training_209999/teacher_checkpoint.pth"
